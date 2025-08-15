@@ -178,10 +178,10 @@ defmodule NGram do
   def count_ngrams(token_stream, n) when n >= 1 do
     {counts, _carry} =
       Enum.reduce(token_stream, {%{}, []}, fn token, {counts, carry} ->
-        IO.inspect({counts, carry}, label: "start")
+        # IO.inspect({counts, carry}, label: "start")
         window = (carry ++ [token]) |> take_last(n)
 
-        IO.inspect(window, label: "window")
+        # IO.inspect(window, label: "window")
 
         counts =
           if length(window) == n do
@@ -217,12 +217,150 @@ defmodule NGram do
     |> Enum.sort_by(fn {phrase, count} -> {-count, phrase} end)
     |> Enum.take(k)
   end
+
+  # ========= Parallel per-file (no overlap + boundary stitching) =========
+
+  @default_lines_per_chunk 10_000
+
+  # Public entry: process ONE file in parallel and print that file's results
+  def run_parallel_file(path, opts \\ []) do
+    n = @n
+    lines_per_chunk = Keyword.get(opts, :lines_per_chunk, @default_lines_per_chunk)
+    workers = Keyword.get(opts, :workers, System.schedulers_online())
+
+    IO.puts(
+      "Processing (parallel: workers=#{workers}, chunk_lines=#{lines_per_chunk}): #{path}\n"
+    )
+
+    # Add debug to show chunking start
+    IO.inspect("Starting parallel processing for #{path} with #{workers} workers",
+      label: "DEBUG: run_parallel_file"
+    )
+
+    chunks =
+      File.stream!(path)
+      |> Stream.with_index()
+      |> Stream.chunk_every(lines_per_chunk)
+      |> Stream.with_index()
+      |> Task.async_stream(
+        fn {chunk, chunk_index} ->
+          pid = self() |> inspect()
+          # Extract lines from [{line, index}, ...]
+          lines = Enum.map(chunk, fn {line, _index} -> line end)
+
+          IO.inspect(
+            "Worker (PID: #{pid}) processing chunk #{chunk_index} with #{length(lines)} lines",
+            label: "DEBUG: Worker #{chunk_index}"
+          )
+
+          count_chunk_no_overlap(lines, n)
+        end,
+        max_concurrency: workers,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, r} -> r end)
+
+    # Debug: Show total chunks processed
+    IO.inspect("Processed #{length(chunks)} chunks", label: "DEBUG: run_parallel_file")
+
+    merged =
+      Enum.reduce(chunks, %{}, fn r, acc ->
+        Map.merge(acc, r.counts, fn _k, a, b -> a + b end)
+      end)
+
+    stitched = stitch_adjacent_chunks(chunks, merged, n)
+
+    stitched
+    |> top_k(@top_k)
+    |> Enum.each(fn {p, c} -> IO.puts("#{p} - #{c}") end)
+
+    # spacer
+    IO.puts("")
+  end
+
+  # Process one *chunk* (list of lines). Count ONLY windows fully inside the chunk.
+  # Returns: %{counts: %{}, head: [... up to n-1 ...], tail: [... up to n-1 ...]}
+  defp count_chunk_no_overlap(lines, n) do
+    pid = self() |> inspect()
+
+    {counts, head_tokens, carry} =
+      Enum.reduce(lines, {%{}, [], []}, fn line, {counts, head, carry} ->
+        tokens = line_to_tokens(line)
+
+        IO.inspect(tokens,
+          label: "DEBUG: Worker #{pid} Chunk #{Enum.join(tokens, " ")} Tokens for line"
+        )
+
+        head =
+          if head == [] do
+            Enum.take(tokens, n - 1)
+          else
+            head
+          end
+
+        {counts, carry} =
+          Enum.reduce(tokens, {counts, carry}, fn tok, {m, c} ->
+            win = take_last(c ++ [tok], n)
+            IO.inspect(win, label: "DEBUG: Worker #{pid} Window for n-gram")
+
+            m =
+              if length(win) == n do
+                key = Enum.join(win, " ")
+                IO.inspect(key, label: "DEBUG: Worker #{pid} Counting n-gram")
+                Map.update(m, key, 1, fn v -> v + 1 end)
+              else
+                m
+              end
+
+            {m, take_last(c ++ [tok], n - 1)}
+          end)
+
+        {counts, head, carry}
+      end)
+
+    IO.inspect(head_tokens, label: "DEBUG: Worker #{pid} Head tokens")
+    IO.inspect(carry, label: "DEBUG: Worker #{pid} Tail tokens")
+    IO.inspect(counts, label: "DEBUG: Worker #{pid} Chunk n-gram counts")
+    %{counts: counts, head: head_tokens, tail: carry}
+  end
+
+  # Stitch ALL cross-boundary n-grams between adjacent chunks:
+  # For k in 1..(n-1): last k from left.tail + first (n-k) from right.head
+  defp stitch_adjacent_chunks(chunks, acc, n) do
+    chunks
+    |> Enum.chunk_every(2, 1, :discard)
+    # Add index for debugging
+    |> Enum.with_index()
+    |> Enum.reduce(acc, fn {[left, right], stitch_index}, acc2 ->
+      IO.inspect("Stitching between chunks #{stitch_index} and #{stitch_index + 1}",
+        label: "DEBUG: stitch_adjacent_chunks"
+      )
+
+      IO.inspect({left.tail, right.head}, label: "DEBUG: Left tail, Right head")
+
+      Enum.reduce(1..(n - 1), acc2, fn k, acc3 ->
+        left_needed = k
+        right_needed = n - k
+
+        if length(left.tail) >= left_needed and length(right.head) >= right_needed do
+          left_part = take_last(left.tail, left_needed)
+          right_part = Enum.take(right.head, right_needed)
+          key = Enum.join(left_part ++ right_part, " ")
+          # Debug: Show stitched n-gram
+          IO.inspect(key, label: "DEBUG: Stitched n-gram (k=#{k})")
+          Map.update(acc3, key, 1, fn v -> v + 1 end)
+        else
+          acc3
+        end
+      end)
+    end)
+  end
 end
 
 defmodule RunnerConfig do
   @moduledoc false
   # set to false if you want Run to process a file instead
-  @run_tests true
+  @run_tests false
   def run_tests?, do: @run_tests
 end
 
@@ -412,23 +550,29 @@ if run_tests do
   end
 end
 
-# ---- CLI behavior ----
+# =========================
+# Minimal CLI (always parallel, 8 workers)
+# =========================
+
+args = System.argv()
+run_tests = Enum.member?(args, "--test")
+
 cond do
+  # tests already started above if you gated them on --test
   run_tests ->
-    # tests already started above
     :ok
 
-  # optional: explicit stdin mode if you want it
+  # explicit stdin: `cat file | elixir solution.exs -`
   args == ["-"] ->
     input = IO.read(:stdio, :all)
 
     input
-    # add this helper (below)
     |> NGram.token_stream_from_string()
     |> NGram.count_ngrams(3)
     |> NGram.top_k(100)
     |> Enum.each(fn {p, c} -> IO.puts("#{p} - #{c}") end)
 
+  # no args: try CoderPad defaults
   args == [] ->
     defaults = [
       "/home/coderpad/data/brothers-karamazov.txt",
@@ -438,18 +582,33 @@ cond do
     paths =
       defaults
       |> Enum.filter(&File.exists?/1)
-      |> Enum.uniq()
 
-    case paths do
-      [] ->
-        IO.puts(:stderr, "No default .txt files found in /home/coderpad/data")
-        System.halt(1)
-
-      paths ->
-        IO.puts("Run at: #{NaiveDateTime.utc_now()}")
-        NGram.run(paths)
+    if paths == [] do
+      IO.puts(:stderr, "No default .txt files found in /home/coderpad/data")
+      System.halt(1)
     end
 
+    Enum.each(paths, fn p ->
+      NGram.run_parallel_file(p, workers: 8, lines_per_chunk: 10_000)
+    end)
+
+  # files provided: always parallel, 8 workers
   true ->
-    NGram.run(Enum.reject(args, &(&1 == "--test")))
+    paths =
+      args
+      |> Enum.reject(&String.starts_with?(&1, "--"))
+      |> Enum.filter(&File.exists?/1)
+
+    if paths == [] do
+      IO.puts(
+        :stderr,
+        "Usage: elixir solution.exs <file> [<file> ...]  |  cat <file> | elixir solution.exs -  |  elixir solution.exs --test"
+      )
+
+      System.halt(1)
+    end
+
+    Enum.each(paths, fn p ->
+      NGram.run_parallel_file(p, workers: 8, lines_per_chunk: 10_000)
+    end)
 end
