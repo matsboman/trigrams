@@ -321,17 +321,17 @@ defmodule NGram do
 
     # phrase-sort -> aggregate -> count-sort -> top K -> print
     script = """
-    sort -k1,1 #{tmp} 2>sort1_error.log \
+    sort -k1,1 #{tmp} 2> /dev/null \
     | awk -F'\\t' '
       BEGIN { prev=""; sum=0 }
       NF != 2 || $2 !~ /^[0-9]+$/ { next }
       prev==$1 { sum+=$2 }
       prev!=$1 { if (NR>1 && prev != "") printf "%d\\t%s\\n", sum, prev; prev=$1; sum=$2 }
       END { if (prev != "") printf "%d\\t%s\\n", sum, prev }
-    ' 2>awk1_error.log \
-    | sort -k1,1nr -k2,2 2>sort2_error.log \
+    ' 2> /dev/null \
+    | sort -k1,1nr -k2,2 2> /dev/null \
     | head -#{k} \
-    | awk -F'\\t' '{print $2 " - " $1}' 2>awk2_error.log
+    | awk -F'\\t' '{print $2 " - " $1}' 2> /dev/null
     """
 
     case System.cmd("bash", ["-c", script], stderr_to_stdout: true) do
@@ -342,7 +342,7 @@ defmodule NGram do
         IO.warn("ranking failed (exit #{code}): #{err}")
     end
 
-    # File.rm(tmp)
+    File.rm(tmp)
   end
 end
 
