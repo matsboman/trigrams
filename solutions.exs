@@ -20,8 +20,8 @@ defmodule NGram do
 
   @n 3
   @top_k 100
-  @default_lines_per_chunk 3
-  @max_concurrent_workers 2
+  @default_lines_per_chunk 10_000
+  @max_concurrent_workers 8
 
   # ===========================
   # Public: simple (non-parallel) per-paths
@@ -75,6 +75,8 @@ defmodule NGram do
     |> String.replace(~r/(?<![\p{L}\p{N}])[-–—]+(?![\p{L}\p{N}])/u, " ")
     # en/em dash inside words → '-'
     |> String.replace(~r/[–—]/u, "-")
+    # Remove control characters
+    |> String.replace(~r/[\x00-\x1F\x7F]+/u, " ")
     # drop other punct
     |> String.replace(~r/[^\p{L}\p{N}'\- ]+/u, " ")
     |> String.split()
@@ -170,11 +172,10 @@ defmodule NGram do
             lines = Enum.map(chunk, fn {line, _i} -> line end)
             result = count_chunk_no_overlap(lines, n, debug: debug)
 
-            # Flush this chunk's counts to Mnesia (read-modify-write)
-            :mnesia.transaction(fn ->
-              Enum.each(result.counts, fn {phrase, count} ->
+            Enum.each(result.counts, fn {phrase, count} ->
+              if is_binary(phrase) and phrase != "" do
                 :mnesia.dirty_update_counter(:ngrams, phrase, count)
-              end)
+              end
             end)
 
             if gc, do: :erlang.garbage_collect()
@@ -249,10 +250,9 @@ defmodule NGram do
           right_part = Enum.take(right.head, right_needed)
           key = Enum.join(left_part ++ right_part, " ")
 
-          :mnesia.transaction(fn ->
-            # IO.inspect(key, label: "Saving cross-boundary trigram")
+          if is_binary(key) and key != "" do
             :mnesia.dirty_update_counter(:ngrams, key, 1)
-          end)
+          end
         end
       end)
     end)
@@ -277,7 +277,7 @@ defmodule NGram do
 
     case :mnesia.create_table(:ngrams,
            attributes: [:phrase, :count],
-           disc_copies: [node()],
+           disc_only_copies: [node()],
            type: :set
          ) do
       {:atomic, :ok} ->
@@ -295,40 +295,54 @@ defmodule NGram do
 
   defp export_and_rank!(k) do
     tmp = "ngram_counts.txt"
-    {:ok, io} = File.open(tmp, [:write])
+    {:ok, io} = File.open(tmp, [:write, :utf8])
 
-    :mnesia.activity(:transaction, fn ->
-      :mnesia.foldl(
-        fn {:ngrams, phrase, count}, acc ->
-          IO.write(io, "#{phrase}\t#{count}\n")
-          acc
-        end,
-        :ok,
-        :ngrams
-      )
+    :mnesia.activity(:async_dirty, fn ->
+      walk = fn walk_fun, key ->
+        case key do
+          :"$end_of_table" ->
+            :ok
+
+          _ ->
+            for {:ngrams, phrase, count} <- :mnesia.dirty_read(:ngrams, key) do
+              IO.write(io, "#{phrase}\t#{count}\n")
+            end
+
+            walk_fun.(walk_fun, :mnesia.dirty_next(:ngrams, key))
+        end
+      end
+
+      first = :mnesia.dirty_first(:ngrams)
+      walk.(walk, first)
     end)
 
-    :ok = :file.sync(io)
-    :ok = File.close(io)
+    :file.sync(io)
+    File.close(io)
 
-    # sort by phrase, sum duplicates, then sort by count desc, phrase asc, head K
+    # phrase-sort -> aggregate -> count-sort -> top K -> print
     script = """
-    sort -k1,1 #{tmp} \
-    | awk -F'\\t' 'prev==$1{sum+=$2} prev!=$1{if(NR>1) printf "%d\\t%s\\n", sum, prev; prev=$1; sum=$2} END{if(prev) printf "%d\\t%s\\n", sum, prev}' \
-    | sort -k1,1nr -k2,2 \
+    sort -k1,1 #{tmp} 2>sort1_error.log \
+    | awk -F'\\t' '
+      BEGIN { prev=""; sum=0 }
+      NF != 2 || $2 !~ /^[0-9]+$/ { next }
+      prev==$1 { sum+=$2 }
+      prev!=$1 { if (NR>1 && prev != "") printf "%d\\t%s\\n", sum, prev; prev=$1; sum=$2 }
+      END { if (prev != "") printf "%d\\t%s\\n", sum, prev }
+    ' 2>awk1_error.log \
+    | sort -k1,1nr -k2,2 2>sort2_error.log \
     | head -#{k} \
-    | awk -F'\\t' '{print $2 " - " $1}'
+    | awk -F'\\t' '{print $2 " - " $1}' 2>awk2_error.log
     """
 
     case System.cmd("bash", ["-c", script], stderr_to_stdout: true) do
       {output, 0} ->
         IO.write(output)
 
-      {error, code} ->
-        IO.warn("ranking failed (exit #{code}): #{error}")
+      {err, code} ->
+        IO.warn("ranking failed (exit #{code}): #{err}")
     end
 
-    File.rm(tmp)
+    # File.rm(tmp)
   end
 end
 
@@ -424,7 +438,7 @@ defmodule NGram.CLI do
         end
 
         Enum.each(paths, fn p ->
-          NGram.run_parallel_file(p, workers: 2, lines_per_chunk: 3, debug: true)
+          NGram.run_parallel_file(p, workers: 8, lines_per_chunk: 10_000, debug: false)
         end)
 
       true ->
@@ -443,7 +457,7 @@ defmodule NGram.CLI do
         end
 
         Enum.each(paths, fn p ->
-          NGram.run_parallel_file(p, workers: 2, lines_per_chunk: 3, debug: true)
+          NGram.run_parallel_file(p, workers: 8, lines_per_chunk: 10_000, debug: false)
         end)
     end
   end
