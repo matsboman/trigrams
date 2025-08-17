@@ -37,7 +37,7 @@ defmodule NGram do
   elixir solution.exs texts/moby_dick.txt
   ```
 
-  **Multiple files combined:**
+  **Multiple files:**
   ```bash
   elixir solution.exs texts/moby_dick.txt texts/brothers-karamazov.txt
   ```
@@ -86,35 +86,146 @@ defmodule NGram do
   @n 3
   @top_k 100
 
-  @spec run([String.t()]) :: :ok | :noop
-  def run(paths) when is_list(paths) and paths != [] do
+  @spec run_parallel([String.t()]) :: :ok | :noop
+  def run_parallel(paths) when is_list(paths) and paths != [] do
+    n = @n
+    workers = System.schedulers_online()
+    lines_per_chunk = 1000
+    debug = false
+
     # Capture start time
     start_time = DateTime.utc_now()
     IO.puts("Start time: #{DateTime.to_string(start_time)}")
+    IO.puts("Workers: #{workers}")
+    IO.puts("Lines per chunk: #{lines_per_chunk}")
 
     Enum.each(paths, fn path ->
       IO.puts("Processing: #{path}\n")
 
-      path
-      |> token_stream()
-      |> count_ngrams(@n)
-      |> top_k(@top_k)
-      |> Enum.each(fn {phrase, count} ->
-        IO.puts("#{phrase} - #{count}")
+      chunks =
+        path
+        |> File.stream!()
+        |> Stream.chunk_every(lines_per_chunk)
+        |> Stream.with_index()
+        |> Task.async_stream(
+          fn {lines, index} ->
+            count_chunk_no_overlap(lines, n, index, debug: debug)
+          end,
+          max_concurrency: workers,
+          timeout: :infinity
+        )
+        |> Enum.map(fn {:ok, r} -> r end)
+        |> Enum.sort_by(& &1.idx)
+
+      stitched_counts = stitch_adjacent_chunks(chunks, n)
+
+      chunks
+      |> Enum.reduce(%{}, fn %{counts: c}, acc ->
+        merge_counts(c, acc)
       end)
+      |> merge_counts(stitched_counts)
+      |> top_k(@top_k)
+      |> Enum.each(fn {trigram, count} -> IO.puts("#{trigram} - #{count}") end)
 
       # spacer between files
       IO.puts("")
+    end)
 
-      # Capture end time and calculate duration
-      end_time = DateTime.utc_now()
-      duration = DateTime.diff(end_time, start_time, :second)
+    end_time = DateTime.utc_now()
+    duration = DateTime.diff(end_time, start_time, :millisecond)
 
-      duration_str =
-        if duration >= 60, do: "#{div(duration, 60)}m #{rem(duration, 60)}s", else: "#{duration}s"
+    IO.puts("End time: #{DateTime.to_string(end_time)}")
+    IO.puts("Duration: #{duration} milliseconds")
+  end
 
-      IO.puts("End time: #{DateTime.to_string(end_time)}")
-      IO.puts("Duration: #{duration_str}")
+  defp merge_counts(c1, c2) when is_map(c1) and is_map(c2) do
+    if map_size(c1) <= map_size(c2) do
+      Enum.reduce(c1, c2, fn {k, v}, acc -> Map.update(acc, k, v, &(&1 + v)) end)
+    else
+      Enum.reduce(c2, c1, fn {k, v}, acc -> Map.update(acc, k, v, &(&1 + v)) end)
+    end
+  end
+
+  # Count only windows fully inside the chunk; return head/tail for stitching
+  defp count_chunk_no_overlap(lines, n, chunk_index, opts) do
+    # IO.inspect(lines)
+    debug = Keyword.get(opts, :debug, false)
+    pid = inspect(self())
+
+    {counts, head_tokens, carry} =
+      Enum.reduce(lines, {%{}, [], []}, fn line, {counts, head, carry} ->
+        tokens = line_to_tokens(line)
+        # IO.inspect(line, label: "#{pid} line")
+        # IO.inspect(tokens, label: "#{pid} tokens")
+
+        if tokens == [] do
+          # Skip empty lines
+          {counts, head, carry}
+        else
+          head = if head == [], do: Enum.take(tokens, n - 1), else: head
+          # IO.inspect(head, label: "#{pid} head")
+          # IO.inspect(counts, label: "#{pid} counts")
+          # IO.inspect(carry, label: "#{pid} carry")
+
+          {counts, carry} =
+            Enum.reduce(tokens, {counts, carry}, fn tok, {m, c} ->
+              # current window candidate
+              base = c ++ [tok]
+
+              # only when we actually have n tokens
+              m =
+                if length(base) == n do
+                  key = Enum.join(base, " ")
+                  Map.update(m, key, 1, &(&1 + 1))
+                else
+                  m
+                end
+
+              # update carry for next token
+              {m, take_last(base, n - 1)}
+            end)
+
+          {counts, head, carry}
+        end
+      end)
+
+    if debug do
+      IO.inspect(head_tokens, label: "DEBUG #{pid} head")
+      IO.inspect(carry, label: "DEBUG #{pid} tail")
+      IO.inspect(counts, label: "DEBUG #{pid} counts")
+    end
+
+    %{counts: counts, head: head_tokens, tail: carry, idx: chunk_index}
+  end
+
+  # For k in 1..n-1 stitch tail_k(left) + head_(n-k)(right)
+  defp stitch_adjacent_chunks(chunks, n) do
+    chunks
+    # Chunk every 2 elements and step 1 at a time to form pairs
+    # discard any element that doesn't fit in a pair
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.reduce(%{}, fn [left, right], acc ->
+      # IO.inspect(acc, label: "chunked")
+
+      Enum.reduce(1..(n - 1), acc, fn k, acc1 ->
+        left_needed = k
+        right_needed = n - k
+
+        # IO.inspect(k, label: "left_needed k")
+        # IO.inspect(n - k, label: "right_needed n - k")
+
+        if length(left.tail) >= left_needed and length(right.head) >= right_needed do
+          left_part = take_last(left.tail, left_needed)
+          right_part = Enum.take(right.head, right_needed)
+          key = Enum.join(left_part ++ right_part, " ")
+
+          # IO.inspect(key, label: "stiched trigram")
+
+          Map.update(acc1, key, 1, &(&1 + 1))
+        else
+          acc1
+        end
+      end)
     end)
   end
 
@@ -171,8 +282,8 @@ defmodule NGram do
     |> String.trim("-")
     # Collapse doubled apostrophes
     |> then(&Regex.replace(~r/'{2,}/, &1, "'"))
-    # Plural possessive: dogs' -> dogs
-    |> then(fn w -> Regex.replace(~r/([a-z0-9])'$/u, w, "\\1") end)
+    # Plural possessive: dogs' -> dogs (also works for unicode letters/digits)
+    |> then(fn w -> Regex.replace(~r/([\p{L}\p{N}])'$/u, w, "\\1") end)
   end
 
   # --- N-gram counting ------------------------------------------------------
@@ -192,17 +303,17 @@ defmodule NGram do
   def count_ngrams(token_stream, n) when n >= 1 do
     {counts, _carry} =
       Enum.reduce(token_stream, {%{}, []}, fn token, {counts, carry} ->
-        window = (carry ++ [token]) |> take_last(n)
+        base = carry ++ [token]
 
         counts =
-          if length(window) == n do
-            key = Enum.join(window, " ")
+          if length(base) == n do
+            key = Enum.join(base, " ")
             Map.update(counts, key, 1, &(&1 + 1))
           else
             counts
           end
 
-        {counts, take_last(carry ++ [token], n - 1)}
+        {counts, take_last(base, n - 1)}
       end)
 
     counts
@@ -458,9 +569,9 @@ cond do
 
       paths ->
         IO.puts("Run at: #{NaiveDateTime.utc_now()}")
-        NGram.run(paths)
+        NGram.run_parallel(paths)
     end
 
   true ->
-    NGram.run(Enum.reject(args, &(&1 == "--test")))
+    NGram.run_parallel(Enum.reject(args, &(&1 == "--test")))
 end
