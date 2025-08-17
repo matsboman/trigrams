@@ -66,7 +66,7 @@ defmodule NGram do
     |> Stream.flat_map(&line_to_tokens/1)
   end
 
-  defp line_to_tokens(line) do
+  def line_to_tokens(line) do
     line
     |> String.downcase()
     # curly → '
@@ -86,10 +86,14 @@ defmodule NGram do
 
   defp normalize_token(word) do
     word
+    # 1: Trim leading/trailing single quotes
     |> String.trim("'")
+    # 2: Trim leading/trailing hyphens
     |> String.trim("-")
-    |> then(&Regex.replace(~r/'{2,}/, &1, "'"))
-    |> then(fn w -> Regex.replace(~r/([a-z0-9])'$/u, w, "\\1") end)
+    # 3: Replace multiple hyphens with a single hyphen
+    |> then(&Regex.replace(~r/-{2,}/, &1, "-"))
+    # 4: Remove single quotes not followed by 's' or 't'
+    |> then(&Regex.replace(~r/'(?![st])/u, &1, ""))
   end
 
   # ===========================
@@ -147,89 +151,112 @@ defmodule NGram do
     lines_per_chunk = Keyword.get(opts, :lines_per_chunk, @default_lines_per_chunk)
     workers = Keyword.get(opts, :workers, @max_concurrent_workers)
     debug = Keyword.get(opts, :debug, false)
-    gc = Keyword.get(opts, :gc, false)
 
     IO.puts(
       "Processing (parallel: workers=#{workers}, chunk_lines=#{lines_per_chunk}): #{path}\n"
     )
 
-    ensure_mnesia!()
+    # Capture start time
+    start_time = DateTime.utc_now()
+    IO.puts("Start time: #{DateTime.to_string(start_time)}")
 
-    # fresh table per run
+    ensure_mnesia!()
     create_or_clear_table!()
 
-    # Process in batches (to cap concurrency bursts)
     chunks =
       File.stream!(path)
-      |> Stream.with_index()
       |> Stream.chunk_every(lines_per_chunk)
       |> Stream.with_index()
-      |> Stream.chunk_every(workers)
-      |> Enum.flat_map(fn batch ->
-        Task.async_stream(
-          batch,
-          fn {chunk, chunk_index} ->
-            lines = Enum.map(chunk, fn {line, _i} -> line end)
-            result = count_chunk_no_overlap(lines, n, debug: debug)
+      |> Task.async_stream(
+        fn {lines, chunk_index} ->
+          result = count_chunk_no_overlap(lines, n, debug: debug)
 
-            Enum.each(result.counts, fn {phrase, count} ->
-              if is_binary(phrase) and phrase != "" do
+          Enum.each(result.counts, fn {phrase, count} ->
+            if is_binary(phrase) and phrase != "" do
+              try do
                 :mnesia.dirty_update_counter(:ngrams, phrase, count)
+              catch
+                error -> IO.puts(:stderr, "Mnesia write error for #{phrase}: #{inspect(error)}")
               end
-            end)
+            end
+          end)
 
-            if gc, do: :erlang.garbage_collect()
-            %{head: result.head, tail: result.tail, idx: chunk_index}
-          end,
-          max_concurrency: workers,
-          timeout: :infinity
-        )
-        |> Enum.map(fn {:ok, r} -> r end)
-      end)
-      # Keep in order for stitching
+          %{head: result.head, tail: result.tail, idx: chunk_index}
+        end,
+        max_concurrency: workers,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, r} -> r end)
       |> Enum.sort_by(& &1.idx)
 
-    # Stitch cross-boundary n-grams (left.tail + right.head combinations)
+    IO.inspect(chunks)
+
     stitch_adjacent_chunks(chunks, n)
-
-    # Export & rank with external sort (low memory)
     export_and_rank!(@top_k)
-
     IO.puts("")
+
+    # Capture end time and calculate duration
+    end_time = DateTime.utc_now()
+    duration = DateTime.diff(end_time, start_time, :second)
+
+    duration_str =
+      if duration >= 60, do: "#{div(duration, 60)}m #{rem(duration, 60)}s", else: "#{duration}s"
+
+    IO.puts("End time: #{DateTime.to_string(end_time)}")
+    IO.puts("Duration: #{duration_str}")
+
+    # Ensure clean shutdown
+    :mnesia.stop()
   end
 
   # Count only windows fully inside the chunk; return head/tail for stitching
   defp count_chunk_no_overlap(lines, n, opts) do
+    # IO.inspect(lines)
     debug = Keyword.get(opts, :debug, false)
     pid = inspect(self())
 
     {counts, head_tokens, carry} =
       Enum.reduce(lines, {%{}, [], []}, fn line, {counts, head, carry} ->
         tokens = line_to_tokens(line)
-        head = if head == [], do: Enum.take(tokens, n - 1), else: head
+        # IO.inspect(line, label: "#{pid} line")
+        # IO.inspect(tokens, label: "#{pid} tokens")
 
-        {counts, carry} =
-          Enum.reduce(tokens, {counts, carry}, fn tok, {m, c} ->
-            win = take_last(c ++ [tok], n)
+        if tokens == [] do
+          # Skip empty lines
+          {counts, head, carry}
+        else
+          head = if head == [], do: Enum.take(tokens, n - 1), else: head
+          # IO.inspect(head, label: "#{pid} head")
+          # IO.inspect(counts, label: "#{pid} counts")
+          # IO.inspect(carry, label: "#{pid} carry")
 
-            m =
-              if length(win) == n do
-                key = Enum.join(win, " ")
-                Map.update(m, key, 1, fn v -> v + 1 end)
-              else
-                m
-              end
+          {counts, carry} =
+            Enum.reduce(tokens, {counts, carry}, fn tok, {m, c} ->
+              # IO.inspect({tok, m, c})
+              win = take_last(c ++ [tok], n)
+              # IO.inspect(win, label: "#{pid} win")
 
-            {m, take_last(c ++ [tok], n - 1)}
-          end)
+              m =
+                if length(win) == n do
+                  key = Enum.join(win, " ")
+                  Map.update(m, key, 1, fn v -> v + 1 end)
+                else
+                  m
+                end
 
-        {counts, head, carry}
+              # IO.inspect(take_last(c ++ [tok], n - 1), label: "take last 2 of carry ready for new token")
+
+              {m, take_last(c ++ [tok], n - 1)}
+            end)
+
+          {counts, head, carry}
+        end
       end)
 
     if debug do
       IO.inspect(head_tokens, label: "DEBUG #{pid} head")
-      IO.inspect(carry, label: "DEBUG  #{pid} tail")
-      IO.inspect(counts, label: "DEBUG  #{pid} counts")
+      IO.inspect(carry, label: "DEBUG #{pid} tail")
+      IO.inspect(counts, label: "DEBUG #{pid} counts")
     end
 
     %{counts: counts, head: head_tokens, tail: carry}
@@ -238,17 +265,25 @@ defmodule NGram do
   # For k in 1..n-1 stitch tail_k(left) + head_(n-k)(right)
   defp stitch_adjacent_chunks(chunks, n) do
     chunks
+    # Chunk every 2 elements and step 1 at a time to form pairs
+    # discard any element that doesn't fit in a pair
     |> Enum.chunk_every(2, 1, :discard)
     |> Enum.with_index()
     |> Enum.each(fn {[left, right], _i} ->
+      # IO.inspect(chunked, label: "chunked")
       Enum.each(1..(n - 1), fn k ->
         left_needed = k
         right_needed = n - k
+
+        # IO.inspect(k, label: "left_needed k")
+        # IO.inspect(n - k, label: "right_needed n - k")
 
         if length(left.tail) >= left_needed and length(right.head) >= right_needed do
           left_part = take_last(left.tail, left_needed)
           right_part = Enum.take(right.head, right_needed)
           key = Enum.join(left_part ++ right_part, " ")
+
+          # IO.inspect(key, label: "stiched trigram")
 
           if is_binary(key) and key != "" do
             :mnesia.dirty_update_counter(:ngrams, key, 1)
@@ -277,7 +312,7 @@ defmodule NGram do
 
     case :mnesia.create_table(:ngrams,
            attributes: [:phrase, :count],
-           disc_only_copies: [node()],
+           disc_copies: [node()],
            type: :set
          ) do
       {:atomic, :ok} ->
@@ -413,6 +448,36 @@ defmodule NGram.CLI do
 
             assert ranked == expected
           end
+
+          test "line_to_tokens handles Moby-Dick-style text" do
+            # Realistic input with contractions, hyphens, punctuation
+            input =
+              "Ishmael’s voyage, isn’t it? Rock-n--roll! --- Call me Ishmael. This is a -test- 'and' it isn't real."
+
+            expected = [
+              "ishmael's",
+              "voyage",
+              "isn't",
+              "it",
+              "rock-n-roll",
+              "call",
+              "me",
+              "ishmael",
+              "this",
+              "is",
+              "a",
+              "test",
+              "and",
+              "it",
+              "isn't",
+              "real"
+            ]
+
+            # Write to temp file and process
+            path = write_tmp!("moby_dick_sample.txt", input)
+            result = File.stream!(path) |> Enum.flat_map(&NGram.line_to_tokens/1)
+            assert result == expected, "Expected #{inspect(expected)}, got #{inspect(result)}"
+          end
         end
 
       args == ["-"] ->
@@ -438,7 +503,7 @@ defmodule NGram.CLI do
         end
 
         Enum.each(paths, fn p ->
-          NGram.run_parallel_file(p, workers: 8, lines_per_chunk: 10_000, debug: false)
+          NGram.run_parallel_file(p, workers: 10, lines_per_chunk: 1000, debug: false)
         end)
 
       true ->
@@ -457,7 +522,7 @@ defmodule NGram.CLI do
         end
 
         Enum.each(paths, fn p ->
-          NGram.run_parallel_file(p, workers: 8, lines_per_chunk: 10_000, debug: false)
+          NGram.run_parallel_file(p, workers: 10, lines_per_chunk: 1000, debug: false)
         end)
     end
   end
