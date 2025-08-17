@@ -88,6 +88,10 @@ defmodule NGram do
 
   @spec run([String.t()]) :: :ok | :noop
   def run(paths) when is_list(paths) and paths != [] do
+    # Capture start time
+    start_time = DateTime.utc_now()
+    IO.puts("Start time: #{DateTime.to_string(start_time)}")
+
     Enum.each(paths, fn path ->
       IO.puts("Processing: #{path}\n")
 
@@ -101,6 +105,16 @@ defmodule NGram do
 
       # spacer between files
       IO.puts("")
+
+      # Capture end time and calculate duration
+      end_time = DateTime.utc_now()
+      duration = DateTime.diff(end_time, start_time, :second)
+
+      duration_str =
+        if duration >= 60, do: "#{div(duration, 60)}m #{rem(duration, 60)}s", else: "#{duration}s"
+
+      IO.puts("End time: #{DateTime.to_string(end_time)}")
+      IO.puts("Duration: #{duration_str}")
     end)
   end
 
@@ -178,10 +192,7 @@ defmodule NGram do
   def count_ngrams(token_stream, n) when n >= 1 do
     {counts, _carry} =
       Enum.reduce(token_stream, {%{}, []}, fn token, {counts, carry} ->
-        IO.inspect({counts, carry}, label: "start")
         window = (carry ++ [token]) |> take_last(n)
-
-        IO.inspect(window, label: "window")
 
         counts =
           if length(window) == n do
@@ -222,7 +233,7 @@ end
 defmodule RunnerConfig do
   @moduledoc false
   # set to false if you want Run to process a file instead
-  @run_tests true
+  @run_tests false
   def run_tests?, do: @run_tests
 end
 
