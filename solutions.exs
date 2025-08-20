@@ -90,40 +90,28 @@ defmodule NGram do
   def run_parallel(paths) when is_list(paths) and paths != [] do
     n = @n
     workers = System.schedulers_online()
-    lines_per_chunk = 1000
+    tokens_per_chunk = 50_000
+    overlap = n - 1
+    step = max(tokens_per_chunk - overlap, 1)
     debug = false
 
-    # Capture start time
     start_time = DateTime.utc_now()
     IO.puts("Start time: #{DateTime.to_string(start_time)}")
     IO.puts("Workers: #{workers}")
-    IO.puts("Lines per chunk: #{lines_per_chunk}")
+    IO.puts("Tokens per chunk: #{tokens_per_chunk}")
 
     Enum.each(paths, fn path ->
       IO.puts("Processing: #{path}\n")
 
-      chunks =
-        path
-        |> File.stream!()
-        |> Stream.chunk_every(lines_per_chunk)
-        |> Stream.with_index()
-        |> Task.async_stream(
-          fn {lines, index} ->
-            count_chunk_no_overlap(lines, n, index, debug: debug)
-          end,
-          max_concurrency: workers,
-          timeout: :infinity
-        )
-        |> Enum.map(fn {:ok, r} -> r end)
-        |> Enum.sort_by(& &1.idx)
-
-      stitched_counts = stitch_adjacent_chunks(chunks, n)
-
-      chunks
-      |> Enum.reduce(%{}, fn %{counts: c}, acc ->
-        merge_counts(c, acc)
-      end)
-      |> merge_counts(stitched_counts)
+      path
+      |> File.stream!()
+      |> Stream.flat_map(&line_to_tokens/1)
+      |> Stream.chunk_every(tokens_per_chunk, step, [])
+      |> Task.async_stream(fn tokens -> count_tokens(tokens, n, debug: debug) end,
+        max_concurrency: workers,
+        timeout: :infinity
+      )
+      |> Enum.reduce(%{}, fn {:ok, c}, acc -> merge_counts(c, acc) end)
       |> top_k(@top_k)
       |> Enum.each(fn {trigram, count} -> IO.puts("#{trigram} - #{count}") end)
 
@@ -138,95 +126,41 @@ defmodule NGram do
     IO.puts("Duration: #{duration} milliseconds")
   end
 
+  defp count_tokens(tokens, n, debug: debug) do
+    pid = inspect(self())
+
+    {counts, _carry} =
+      Enum.reduce(tokens, {%{}, []}, fn tok, {acc, cr} ->
+        # current window candidate
+        base = cr ++ [tok]
+
+        # only when we actually have n tokens
+        acc =
+          if length(base) == n do
+            [a, b, c] = base
+            key = IO.iodata_to_binary([a, " ", b, " ", c])
+            Map.update(acc, key, 1, &(&1 + 1))
+          else
+            acc
+          end
+
+        # update carry for next token
+        {acc, take_last(base, n - 1)}
+      end)
+
+    if debug do
+      IO.inspect(counts, label: "DEBUG #{pid} counts")
+    end
+
+    counts
+  end
+
   defp merge_counts(c1, c2) when is_map(c1) and is_map(c2) do
     if map_size(c1) <= map_size(c2) do
       Enum.reduce(c1, c2, fn {k, v}, acc -> Map.update(acc, k, v, &(&1 + v)) end)
     else
       Enum.reduce(c2, c1, fn {k, v}, acc -> Map.update(acc, k, v, &(&1 + v)) end)
     end
-  end
-
-  # Count only windows fully inside the chunk; return head/tail for stitching
-  defp count_chunk_no_overlap(lines, n, chunk_index, opts) do
-    # IO.inspect(lines)
-    debug = Keyword.get(opts, :debug, false)
-    pid = inspect(self())
-
-    {counts, head_tokens, carry} =
-      Enum.reduce(lines, {%{}, [], []}, fn line, {counts, head, carry} ->
-        tokens = line_to_tokens(line)
-        # IO.inspect(line, label: "#{pid} line")
-        # IO.inspect(tokens, label: "#{pid} tokens")
-
-        if tokens == [] do
-          # Skip empty lines
-          {counts, head, carry}
-        else
-          head = if head == [], do: Enum.take(tokens, n - 1), else: head
-          # IO.inspect(head, label: "#{pid} head")
-          # IO.inspect(counts, label: "#{pid} counts")
-          # IO.inspect(carry, label: "#{pid} carry")
-
-          {counts, carry} =
-            Enum.reduce(tokens, {counts, carry}, fn tok, {m, c} ->
-              # current window candidate
-              base = c ++ [tok]
-
-              # only when we actually have n tokens
-              m =
-                if length(base) == n do
-                  key = Enum.join(base, " ")
-                  Map.update(m, key, 1, &(&1 + 1))
-                else
-                  m
-                end
-
-              # update carry for next token
-              {m, take_last(base, n - 1)}
-            end)
-
-          {counts, head, carry}
-        end
-      end)
-
-    if debug do
-      IO.inspect(head_tokens, label: "DEBUG #{pid} head")
-      IO.inspect(carry, label: "DEBUG #{pid} tail")
-      IO.inspect(counts, label: "DEBUG #{pid} counts")
-    end
-
-    %{counts: counts, head: head_tokens, tail: carry, idx: chunk_index}
-  end
-
-  # For k in 1..n-1 stitch tail_k(left) + head_(n-k)(right)
-  defp stitch_adjacent_chunks(chunks, n) do
-    chunks
-    # Chunk every 2 elements and step 1 at a time to form pairs
-    # discard any element that doesn't fit in a pair
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.reduce(%{}, fn [left, right], acc ->
-      # IO.inspect(acc, label: "chunked")
-
-      Enum.reduce(1..(n - 1), acc, fn k, acc1 ->
-        left_needed = k
-        right_needed = n - k
-
-        # IO.inspect(k, label: "left_needed k")
-        # IO.inspect(n - k, label: "right_needed n - k")
-
-        if length(left.tail) >= left_needed and length(right.head) >= right_needed do
-          left_part = take_last(left.tail, left_needed)
-          right_part = Enum.take(right.head, right_needed)
-          key = Enum.join(left_part ++ right_part, " ")
-
-          # IO.inspect(key, label: "stiched trigram")
-
-          Map.update(acc1, key, 1, &(&1 + 1))
-        else
-          acc1
-        end
-      end)
-    end)
   end
 
   # --- Tokenization ---------------------------------------------------------
